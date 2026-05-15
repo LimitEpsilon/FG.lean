@@ -1,0 +1,10 @@
+name = "FG"
+version = "0.1.0"
+defaultTargets = ["FG"]
+
+[[lean_lib]]
+name = "FG"
+
+[[lean_lib]]
+name = "Paco"
+globs = ["Paco", "Paco.+"]
