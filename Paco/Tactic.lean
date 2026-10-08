@@ -2,6 +2,7 @@ import Paco.PacoDefs
 import Lean.Elab.Tactic.ElabTerm
 import Lean.Meta.Closure
 import Lean.Meta.Tactic.Replace
+import Lean.Meta.Transform
 
 /-!
 # Paco tactics
@@ -123,13 +124,31 @@ with `plfp F ⊤ₚ` using `Paco.eq_plfp_top`. Everything that depends on this e
 section.
 -/
 
-/-- An application `C a₁ ⋯ aₘ` of a predicate defined with `coinductive_fixpoint`, together with
-its translation to `plfp`. -/
-structure FixpointApp where
+/-- A monotone functional `f` on a lattice `α`, as found in a `coinductive_fixpoint` definition. -/
+structure Functional where
+  /-- Universe levels of `α`, as used for the constants of this library. -/
+  us : List Level
+  α : Expr
+  inst : Expr
+  f : Expr
+  /-- A proof of `Paco.monotone f`. -/
+  hm : Expr
+
+/-- An application `C a₁ ⋯ aₘ` of a predicate defined with `coinductive_fixpoint`, which is
+`lfp F x₁ ⋯ xₙ` for its functional `F`. -/
+structure FixpointApp extends Functional where
+  /-- The arguments `x₁ ⋯ xₙ` of the fixed point. -/
+  args : Array Expr
+  /-- A proof of `C a₁ ⋯ aₘ = lfp F x₁ ⋯ xₙ`. -/
+  eqLfp : Expr
   /-- The translation `plfp F ⊤ₚ x₁ ⋯ xₙ`. -/
   paco : Expr
   /-- A proof of `C a₁ ⋯ aₘ = plfp F ⊤ₚ x₁ ⋯ xₙ`. -/
   eq : Expr
+
+/-- `lfp F x₁ ⋯ xₙ` -/
+def FixpointApp.lfp (fp : FixpointApp) : Expr :=
+  mkAppN (mkAppN (.const ``Paco.lfp fp.us) #[fp.α, fp.inst, fp.f]) fp.args
 
 /-- Unfold the head constant of `e`, even if it is irreducible. -/
 private def unfoldHead? (e : Expr) : MetaM (Option Expr) := do
@@ -160,7 +179,10 @@ def FixpointApp.match? (e : Expr) : MetaM (Option FixpointApp) := do
     return none
   let xs := lfpApp.getAppArgs
   let usL := lfpApp.getAppFn.constLevels!
-  let (α, instL, F, hmL, args) := (xs[0]!, xs[1]!, xs[2]!, xs[3]!, xs.extract 4)
+  let (α, instL, FL, hmL, args) := (xs[0]!, xs[1]!, xs[2]!, xs[3]!, xs.extract 4)
+  -- `F` and `FL` are definitionally equal; `F` is displayed in goals. Lean annotates recursive
+  -- calls in `FL` with metadata, which we remove.
+  let F := (← Core.transform FL (post := fun e => return .done e.consumeMData)).eta
   let us := [← getLevel α]
   let some inst ← synthInstance? (mkApp (.const ``CompleteLattice us) α) |
     throwError "paco: cannot find a `Paco.CompleteLattice` instance for{indentExpr α}"
@@ -174,25 +196,28 @@ def FixpointApp.match? (e : Expr) : MetaM (Option FixpointApp) := do
       which is the least fixed point of a function satisfying{indentExpr (← inferType hmL)}\n\
       instead of{indentExpr monType}"
   let hm ← mkAuxTheorem monType hmL (kind? := `_paco_mon)
-  let pred := mkAppN (.const ``Lean.Order.lfp_monotone usL) #[α, instL, F, hmL]
-  let hfix := mkAppN (.const ``Lean.Order.lfp_monotone_fix usL) #[α, instL, F, hmL]
+  let pred := mkAppN (.const ``Lean.Order.lfp_monotone usL) #[α, instL, FL, hmL]
+  let hfix := mkAppN (.const ``Lean.Order.lfp_monotone_fix usL) #[α, instL, FL, hmL]
   let hleast ← withLocalDeclD `x α fun x => do
     withLocalDeclD `h (mkAppN (.const ``CompleteLattice.le us) #[α, inst, mkApp F x, x]) fun h =>
       mkLambdaFVars #[x, h] <|
-        mkAppN (.const ``Lean.Order.lfp_le_of_le_monotone usL) #[α, instL, F, hmL, x, h]
+        mkAppN (.const ``Lean.Order.lfp_le_of_le_monotone usL) #[α, instL, FL, hmL, x, h]
   let top := mkAppN (.const ``CompleteLattice.top us) #[α, inst]
   let plfpTop := mkAppN (.const ``plfp us) #[α, inst, F, hm, top]
   let eq := mkAppN (.const ``eq_plfp_top us) #[α, inst, F, hm, pred, hfix, hleast]
   let paco := mkAppN plfpTop args
   let eq ← mkExpectedTypeHint (← mkCongrFunN eq args) (← mkEq e paco)
-  return some { paco, eq }
+  let lfp := mkAppN (mkAppN (.const ``Paco.lfp us) #[α, inst, F]) args
+  let eqLfp := mkAppN (.const ``eq_lfp us) #[α, inst, F, hm, pred, hfix, hleast]
+  let eqLfp ← mkExpectedTypeHint (← mkCongrFunN eqLfp args) (← mkEq e lfp)
+  return some { us, α, inst, f := F, hm, args, eqLfp, paco, eq }
 
 /-! ## `pinit` -/
 
 /-- Transform the conclusion `c` of `∀ x₁ ⋯ xₙ, c` along `k c = some (c', proof of c = c')`.
 Returns `∀ x₁ ⋯ xₙ, c'` and a function mapping a proof of `∀ x₁ ⋯ xₙ, c` to a proof of
 `∀ x₁ ⋯ xₙ, c'` (if `mp`) or conversely. -/
-private def transformConclusion? (type : Expr) (k : Expr → MetaM (Option (Expr × Expr))) :
+def transformConclusion? (type : Expr) (k : Expr → MetaM (Option (Expr × Expr))) :
     MetaM (Option (Expr × (Bool → Expr → MetaM Expr))) := do
   let type ← instantiateMVars type
   let some (typeNew, eqs) ← forallTelescope type fun xs c => do
@@ -323,6 +348,32 @@ def ptop (goal : MVarId) : MetaM Unit := goal.withContext do
 
 /-! ## `pcofix` -/
 
+/-- For a goal `∀ ys, p es` with `p : α` (and `ys` free variables), construct
+* `Q := fun p => ∀ ys, p es`,
+* `l := fun xs => ∀ q, Q q → q xs`, the least predicate satisfying `Q`,
+* `hQ : ∀ p, Q p ↔ p ⊑ l`.
+
+These are the arguments of `plfp_cofix` and `tower_cofix`. -/
+def mkDownSet (us : List Level) (α inst : Expr) (ys es : Array Expr) : MetaM (Expr × Expr × Expr) := do
+  let n := es.size
+  let Q ← withLocalDeclD `p α fun q => do mkLambdaFVars #[q] (← mkForallFVars ys (mkAppN q es))
+  let l ← forallBoundedTelescope α n fun xs _ => withLocalDeclD `q α fun q => do
+    mkLambdaFVars xs (← mkForallFVars #[q] (← mkArrow (Q.beta #[q]) (mkAppN q xs)))
+  -- `p ⊑ l` unfolds to `∀ xs, l xs → p xs`
+  let hQ ← withLocalDeclD `p α fun q => do
+    let lhs := Q.beta #[q]
+    let rhs := mkAppN (.const ``CompleteLattice.le us) #[α, inst, q, l]
+    let mp ← withLocalDeclD `hq lhs fun hq => do
+      let body ← forallBoundedTelescope α n fun xs _ =>
+        withLocalDeclD `hl (l.beta xs) fun hl => mkLambdaFVars (xs.push hl) (mkApp2 hl q hq)
+      mkLambdaFVars #[hq] body
+    let mpr ← withLocalDeclD `h rhs fun h => do
+      let hl ← withLocalDeclD `q α fun q' => withLocalDeclD `hq (Q.beta #[q']) fun hq =>
+        mkLambdaFVars #[q', hq] (mkAppN hq ys)
+      mkLambdaFVars #[h] (← mkLambdaFVars ys (mkApp (mkAppN h es) hl))
+    mkLambdaFVars #[q] (mkApp4 (.const ``Iff.intro []) lhs rhs mp mpr)
+  return (Q, l, hQ)
+
 /-- `pcofix cih with φ` on a goal `∀ ys, c`, where `c` is `C es` (for a predicate `C` defined with
 `coinductive_fixpoint`) or `plfp f r es`. Produces a goal `∀ ys, plfp f φ es` with hypotheses
 `φ` and `cih : ∀ ys, φ es` (and `φ ⊑ r` unless `r` is `⊤ₚ`).
@@ -347,26 +398,7 @@ def pcofix (goal : MVarId) (cihName φName : Name) : MetaM MVarId := do
       if e.hasAnyFVar (ys.contains <| .fvar ·) then
         throwError "pcofix: the coinductive predicate{indentExpr (p.plfpWith p.r)}\n\
           depends on variables quantified in the goal; introduce them first"
-    let es := p.args
-    let n := es.size
-    -- Q := fun p => ∀ ys, p es
-    let Q ← withLocalDeclD `p p.α fun q => do mkLambdaFVars #[q] (← mkForallFVars ys (mkAppN q es))
-    -- l := fun xs => ∀ q, Q q → q xs
-    let l ← forallBoundedTelescope p.α n fun xs _ => withLocalDeclD `q p.α fun q => do
-      mkLambdaFVars xs (← mkForallFVars #[q] (← mkArrow (Q.beta #[q]) (mkAppN q xs)))
-    -- hQ : ∀ p, Q p ↔ p ⊑ l, where `p ⊑ l` unfolds to `∀ xs, l xs → p xs`
-    let hQ ← withLocalDeclD `p p.α fun q => do
-      let lhs := Q.beta #[q]
-      let rhs := p.le q l
-      let mp ← withLocalDeclD `hq lhs fun hq => do
-        let body ← forallBoundedTelescope p.α n fun xs _ =>
-          withLocalDeclD `hl (l.beta xs) fun hl => mkLambdaFVars (xs.push hl) (mkApp2 hl q hq)
-        mkLambdaFVars #[hq] body
-      let mpr ← withLocalDeclD `h rhs fun h => do
-        let hl ← withLocalDeclD `q p.α fun q' => withLocalDeclD `hq (Q.beta #[q']) fun hq =>
-          mkLambdaFVars #[q', hq] (mkAppN hq ys)
-        mkLambdaFVars #[h] (← mkLambdaFVars ys (mkApp (mkAppN h es) hl))
-      mkLambdaFVars #[q] (mkApp4 (.const ``Iff.intro []) lhs rhs mp mpr)
+    let (Q, l, hQ) ← mkDownSet p.us p.α p.inst ys p.args
     return (p, Q, l, hQ)
   -- obg : ∀ φ, φ ⊑ r → Q φ → Q (plfp f φ)
   let incName ← mkFreshUserName `inc
