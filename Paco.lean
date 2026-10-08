@@ -1,2 +1,4 @@
-import Paco.Paco
+import Paco.Lattice
 import Paco.PacoDefs
+import Paco.Tactic
+import Paco.Paco
